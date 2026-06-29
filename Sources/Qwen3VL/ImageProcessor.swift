@@ -119,7 +119,10 @@ public struct Qwen3VLImageProcessor {
 
     public init(
         patchSize: Int = 16, mergeSize: Int = 2, temporalPatchSize: Int = 2,
-        minPixels: Int = 56 * 56, maxPixels: Int = 14 * 14 * 4 * 1280,
+        // Qwen3-VL `preprocessor_config.json` pixel bounds (`size.shortest_edge` / `size.longest_edge`).
+        // NOT the Qwen2-VL `56*56 .. 14*14*4*1280` (=1,003,520) defaults — those over-downscale any
+        // image above ~1002² (e.g. 1024² → 992²), dropping vision tokens and corrupting conditioning.
+        minPixels: Int = 256 * 256, maxPixels: Int = 4096 * 4096,
         mean: [Float] = [0.5, 0.5, 0.5], std: [Float] = [0.5, 0.5, 0.5]
     ) {
         self.patchSize = patchSize
