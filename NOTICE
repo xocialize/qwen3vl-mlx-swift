@@ -1,0 +1,14 @@
+qwen3vl-mlx-swift
+Copyright 2026 Xocialize
+
+A reusable Qwen3-VL Swift/MLX backbone that exposes the pre-`lm_head`
+`last_hidden_state` (the feature image/conditioning models consume).
+
+The model code is adapted from mlx-swift-lm's parity-tested MLXVLM `Qwen3VL.swift`
+(Apple Inc., Apache-2.0; a port of Blaizzy/mlx-vlm `qwen3_vl`), reduced to the model
+surface and extended with `Qwen3VL.lastHiddenState(...)`. The generation/processor
+machinery is dropped; THW / KVCache / createAttentionMask come from MLXLMCommon.
+
+Qwen3-VL model weights: Apache-2.0 (Alibaba), published at
+mlx-community/Qwen3-VL-8B-Instruct and siblings. This repository contains no model
+weights.
