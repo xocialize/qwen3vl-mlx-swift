@@ -945,6 +945,8 @@ enum Qwen3VLLanguage {
         /// boundary once the sequence reaches 1024 tokens — a 1024²-pixel image
         /// grid — corrupting every decoder layer. Chunk rows below the threshold:
         /// output rows are independent, so this is mathematically exact.
+        /// TODO: remove when https://github.com/ml-explore/mlx/issues/3797 is
+        /// fixed and mlx-swift ships the fix.
         func downProjected(_ x: MLXArray) -> MLXArray {
             let tokens = x.dim(-2)
             let rowLimit = 896
