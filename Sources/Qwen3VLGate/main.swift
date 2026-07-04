@@ -48,6 +48,30 @@ let gate = args[0]
 let weights = URL(fileURLWithPath: args[1])
 let fixtures = URL(fileURLWithPath: args[2])
 
+// Standalone NAX split-K GEMM repro — no weights, random seeded tensors.
+// Broken window: half-precision, batch 1, M·N ≥ 2048², K ≥ 10240, K ≥ 3·max(M,N).
+if gate == "--matmul-probe-rand" {
+    // Seeded host-side uniform(-1,1) randoms — deterministic, no MLXRandom dep.
+    var lcg: UInt64 = 0x9E37_79B9_7F4A_7C15
+    func randArray(_ count: Int) -> [Float] {
+        (0 ..< count).map { _ in
+            lcg = lcg &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(Int64(bitPattern: lcg >> 11)) / Float(Int64.max >> 11)
+        }
+    }
+    let (K, N) = (12288, 4096)
+    let b = MLXArray(randArray(N * K), [N, K]).asType(.bfloat16)
+    for m in [512, 896, 1024, 2048] {
+        let a = MLXArray(randArray(m * K), [m, K]).asType(.bfloat16)
+        let y = matmul(a, b.T)
+        let yRef = matmul(a.asType(.float32), b.asType(.float32).T)
+        eval(y, yRef)
+        let mab = abs(y.asType(.float32) - yRef).max().item(Float.self)
+        err("  M=\(m) K=\(K) N=\(N) bf16: cos \(cosine(y, yRef)) max_abs_vs_fp32 \(mab)")
+    }
+    exit(0)
+}
+
 // Image preprocessing parity — needs no model weights.
 if gate == "--preprocess" {
     guard args.count >= 4, let img = decodeRGB(URL(fileURLWithPath: args[3])) else {
