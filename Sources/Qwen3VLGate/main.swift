@@ -113,6 +113,62 @@ do {
         stage("merged", d.merged, g["merged_embeds"]!)
         stage("position_ids", d.positionIds, g["position_ids"]!)
         ok = true
+    case "--matmul-probe":
+        // Raw GEMM check: down_proj(gated) vs the oracle's product, plus shape sweep.
+        let mlpRef = try MLX.loadArrays(url: fixtures.appendingPathComponent("mlp0_bf16.safetensors"))
+        let gated = mlpRef["gated"]!            // [1, 1100, 12288] bf16
+        let refOut = mlpRef["mlp_down"]!        // [1, 1100, 4096] bf16
+        let w = model.debugDownProjWeight(layer: 0)  // [4096, 12288] bf16
+        err("gated dtype \(gated.dtype) w dtype \(w.dtype)")
+        for rows in [64, 256, 512, 640, 768, 896, 1024, 1056, 1088, 1100] {
+            let x = gated[0..., 0 ..< rows, 0...]
+            let y = matmul(x, w.T)
+            eval(y)
+            let r = refOut[0..., 0 ..< rows, 0...]
+            let mab = abs(y.asType(.float32) - r.asType(.float32)).max().item(Float.self)
+            err("  rows=\(rows): cos \(cosine(y, r)) max_abs \(mab)")
+        }
+        // fp32 control at full length
+        let y32 = matmul(gated.asType(.float32), w.asType(.float32).T)
+        eval(y32)
+        err("  fp32 full: cos \(cosine(y32, refOut)) max_abs \(abs(y32 - refOut.asType(.float32)).max().item(Float.self))")
+        // 2-D (no batch dim) control
+        let y2d = matmul(gated[0], w.T)
+        eval(y2d)
+        err("  2d full: cos \(cosine(y2d, refOut[0]))")
+        ok = true
+    case "--attn0-bisect":
+        let g = try MLX.loadArrays(url: fixtures.appendingPathComponent("edit_intermediates.safetensors"))
+        var ref = try MLX.loadArrays(url: fixtures.appendingPathComponent("attn0_bf16.safetensors"))
+        if let mlpRef = try? MLX.loadArrays(url: fixtures.appendingPathComponent("mlp0_bf16.safetensors")) {
+            ref.merge(mlpRef) { a, _ in a }
+        }
+        let stages = model.debugAttn0(
+            mergedEmbeds: g["merged_embeds"]!, positionIds: g["position_ids"]!)
+        for (name, a) in stages {
+            guard let b = ref[name] else { err("  \(name): (no ref)"); continue }
+            eval(a)
+            let mab = abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+            err("  \(name): cos \(cosine(a, b)) max_abs \(mab) shape \(a.shape) vs \(b.shape)")
+        }
+        ok = true
+    case "--lm-bisect":
+        let g = try MLX.loadArrays(url: fixtures.appendingPathComponent("edit_intermediates.safetensors"))
+        let lm = try MLX.loadArrays(url: fixtures.appendingPathComponent("lm_layers.safetensors"))
+        let deepstack = (0..<3).map { g["deep_\($0)"]! }
+        let (layers, final) = model.debugLanguageLayers(
+            inputIds: g["input_ids"]!, mergedEmbeds: g["merged_embeds"]!,
+            positionIds: g["position_ids"]!, deepstackEmbeds: deepstack)
+        func stage(_ name: String, _ a: MLXArray, _ b: MLXArray) {
+            let mab = abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+            err("  \(name): cos \(cosine(a, b)) max_abs \(mab)")
+        }
+        for (i, h) in layers.enumerated() {
+            stage(String(format: "lm_%02d", i), h, lm[String(format: "lm_%02d", i)]!)
+        }
+        eval(final)
+        stage("lm_final", final, lm["lm_final"]!)
+        ok = true
     case "--vision-pre":
         let g = try MLX.loadArrays(url: fixtures.appendingPathComponent("vision_pre.safetensors"))
         let grid = g["grid"]!.asType(.int32).asArray(Int32.self)

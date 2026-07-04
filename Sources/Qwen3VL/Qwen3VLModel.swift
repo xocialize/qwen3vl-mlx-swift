@@ -180,6 +180,29 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
 
 enum Qwen3VLVision {
 
+    /// mlx_vlm.models.base.ensure_fused_sdpa: pad head_dim to a fused-kernel-supported
+    /// size (64/80/128), run mask-free fused SDPA, slice back.
+    static func ensureFusedSDPA(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float
+    ) -> MLXArray {
+        let fusedDims = [64, 80, 128]
+        let d = queries.dim(-1)
+        let target = fusedDims.first { d <= $0 } ?? d
+        var q = queries
+        var k = keys
+        var v = values
+        if target != d {
+            let widths = [IntOrPair((0, 0)), IntOrPair((0, 0)), IntOrPair((0, 0)),
+                          IntOrPair((0, target - d))]
+            q = padded(q, widths: widths)
+            k = padded(k, widths: widths)
+            v = padded(v, widths: widths)
+        }
+        let out = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v, scale: scale, mask: .none)
+        return target != d ? out[.ellipsis, 0 ..< d] : out
+    }
+
     static func rotateHalf(_ x: MLXArray) -> MLXArray {
         let half = x.dim(-1) / 2
         let first = x[.ellipsis, 0 ..< half]
@@ -344,25 +367,27 @@ enum Qwen3VLVision {
             keys = keys.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
             values = values.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
 
-            var mask = ones([1, sequenceLength, sequenceLength], dtype: queries.dtype)
-            mask = mask * MLXArray(-1e9, dtype: queries.dtype)
-
+            // mlx-vlm splits by cu_seqlens and runs mask-free fused SDPA per split
+            // (ensure_fused_sdpa pads head_dim 72 → 80 so the fused kernel — with its
+            // fp32 softmax — handles it). The previous additive [1, L, L] block-diagonal
+            // mask forced the materialized-softmax fallback at head_dim 72, a different
+            // (and at bf16 noticeably noisier) numerics path than the reference.
             let seqlens = cuSeqlens.asArray(Int.self)
+            var attnOutputs: [MLXArray] = []
             for idx in 1 ..< seqlens.count {
                 let start = seqlens[idx - 1]
                 let end = seqlens[idx]
-                mask[0..., start ..< end, start ..< end] = MLXArray(0, dtype: queries.dtype)
+                attnOutputs.append(
+                    Qwen3VLVision.ensureFusedSDPA(
+                        queries: queries[0..., 0..., start ..< end, 0...],
+                        keys: keys[0..., 0..., start ..< end, 0...],
+                        values: values[0..., 0..., start ..< end, 0...],
+                        scale: scale))
             }
 
-            let attended = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: .array(mask)
-            )
-            .transposed(0, 2, 1, 3)
-            .reshaped(sequenceLength, -1)
+            let attended = concatenated(attnOutputs, axis: 2)
+                .transposed(0, 2, 1, 3)
+                .reshaped(sequenceLength, -1)
 
             return proj(attended)
         }
@@ -864,10 +889,17 @@ enum Qwen3VLLanguage {
             (queries, keys) = Qwen3VLLanguage.applyMultimodalRotary(
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
+            // mlx-vlm passes the symbolic "causal" mask for prefill (L > 1) and no mask
+            // for decode — never a materialized array. A materialized bool causal mask
+            // via .array() hits a fused-SDPA path that collapses in bf16 at ≥~1024-token
+            // sequences (layer-0 output garbage → overflow), the root cause of the
+            // 1024²-input Boogu edit banding. Stay symbolic like the reference.
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
             if let mask {
                 let slicedMask = mask[.ellipsis, 0 ..< kvSequenceLength]
                 attentionMask = .array(slicedMask)
+            } else if length > 1 {
+                attentionMask = .causal
             } else {
                 attentionMask = .none
             }
@@ -901,7 +933,30 @@ enum Qwen3VLLanguage {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
+            downProjected(silu(gate(x)) * up(x))
+        }
+
+        /// mlx-swift 0.31.3–0.31.6 dispatches half-precision GEMMs with
+        /// M·N ≥ 2048², K ≥ 10240, K ≥ 3·max(M,N) to `steel_gemm_splitk_axpby_nax`,
+        /// which returns garbage/NaN on M5-class (NAX) GPUs — observed on M5 Max,
+        /// macOS 26.x beta, bit-exactly at the M=1024 dispatch boundary while
+        /// M ≤ 896 is correct (Python mlx 0.31.2, which predates the kernel, is
+        /// correct on the same inputs). down_proj (K=12288, N=4096) crosses that
+        /// boundary once the sequence reaches 1024 tokens — a 1024²-pixel image
+        /// grid — corrupting every decoder layer. Chunk rows below the threshold:
+        /// output rows are independent, so this is mathematically exact.
+        func downProjected(_ x: MLXArray) -> MLXArray {
+            let tokens = x.dim(-2)
+            let rowLimit = 896
+            guard x.dtype != .float32, tokens > rowLimit else { return down(x) }
+            var parts: [MLXArray] = []
+            var start = 0
+            while start < tokens {
+                let end = min(start + rowLimit, tokens)
+                parts.append(down(x[.ellipsis, start ..< end, 0...]))
+                start = end
+            }
+            return concatenated(parts, axis: -2)
         }
     }
 
@@ -934,6 +989,65 @@ enum Qwen3VLLanguage {
             let hidden = x + residual
             residual = mlp(postAttentionLayerNorm(hidden))
             return hidden + residual
+        }
+
+        /// Bisect-only: expose every attention sub-op of this layer, mirroring
+        /// Attention.callAsFunction exactly.
+        func debugAttn0(_ x: MLXArray, positionIds: MLXArray) -> [(String, MLXArray)] {
+            var out: [(String, MLXArray)] = []
+            let attn = attention
+            let (batch, length) = (x.dim(0), x.dim(1))
+
+            let xn = inputLayerNorm(x)
+            out.append(("x_norm", xn))
+
+            let q = attn.wq(xn)
+            let k = attn.wk(xn)
+            let v = attn.wv(xn)
+            out.append(("q_proj", q))
+            out.append(("k_proj", k))
+            out.append(("v_proj", v))
+
+            let qh = attn.qNorm(q.reshaped(batch, length, attn.heads, attn.headDim))
+                .transposed(0, 2, 1, 3)
+            let kh = attn.kNorm(k.reshaped(batch, length, attn.kvHeads, attn.headDim))
+                .transposed(0, 2, 1, 3)
+            let vh = v.reshaped(batch, length, attn.kvHeads, attn.headDim)
+                .transposed(0, 2, 1, 3)
+            out.append(("q_normed", qh))
+            out.append(("k_normed", kh))
+
+            let (cosValues, sinValues) = attn.rotaryEmbedding(
+                positionIds: positionIds, dtype: x.dtype)
+            out.append(("cos", cosValues))
+            out.append(("sin", sinValues))
+
+            let (qr, kr) = Qwen3VLLanguage.applyMultimodalRotary(
+                q: qh, k: kh, cos: cosValues, sin: sinValues)
+            out.append(("q_rot", qr))
+            out.append(("k_rot", kr))
+
+            let attended = MLXFast.scaledDotProductAttention(
+                queries: qr, keys: kr, values: vh, scale: attn.scale, mask: .causal)
+            out.append(("attn_sdpa", attended))
+
+            let o = attn.wo(attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+            out.append(("attn_o", o))
+
+            let hidden = x + o
+            out.append(("h_resid", hidden))
+            let pn = postAttentionLayerNorm(hidden)
+            out.append(("post_norm", pn))
+            let gateOut = mlp.gate(pn)
+            let upOut = mlp.up(pn)
+            out.append(("gate_out", gateOut))
+            out.append(("up_out", upOut))
+            let gated = silu(gateOut) * upOut
+            out.append(("gated", gated))
+            let mlpDown = mlp.downProjected(gated)
+            out.append(("mlp_down", mlpDown))
+            out.append(("layer_out", hidden + mlpDown))
+            return out
         }
     }
 
@@ -971,10 +1085,9 @@ enum Qwen3VLLanguage {
                 fatalError("Either input ids or embeddings must be provided")
             }
 
-            var mask = mask
-            if mask == nil {
-                mask = createAttentionMask(h: hidden, cache: cache)
-            }
+            // Do NOT materialize a causal mask here — a nil mask lets Attention use the
+            // symbolic .causal mode, mirroring mlx-vlm's create_attention_mask returning
+            // the "causal" string (see the mask-mode note in Attention).
 
             for (index, layer) in layers.enumerated() {
                 let layerCache = cache?[index]
@@ -992,6 +1105,14 @@ enum Qwen3VLLanguage {
             }
 
             return norm(hidden)
+        }
+
+        /// Bisect-only alias for the private deepstack scatter-add.
+        func debugApplyDeepstack(
+            hiddenStates: MLXArray, visualMask: MLXArray, visualEmbeds: MLXArray
+        ) -> MLXArray {
+            applyDeepstack(
+                hiddenStates: hiddenStates, visualMask: visualMask, visualEmbeds: visualEmbeds)
         }
 
         private func applyDeepstack(
@@ -1517,6 +1638,50 @@ public final class Qwen3VL: Module {
         -> (patch: MLXArray, pos: MLXArray, rot: MLXArray)
     {
         visionModel.debugPreBlocks(pixelValues, gridTHW: imageGridTHW)
+    }
+
+    /// Bisect helper: raw down_proj weight of a decoder layer.
+    public func debugDownProjWeight(layer: Int) -> MLXArray {
+        languageModel.model.layers[layer].mlp.down.weight
+    }
+
+    /// Bisect helper: layer-0 attention sub-ops in the model dtype, for comparison
+    /// against the oracle's attn0 dump. Returns named intermediates in call order.
+    public func debugAttn0(
+        mergedEmbeds: MLXArray, positionIds: MLXArray
+    ) -> [(String, MLXArray)] {
+        let lm = languageModel.model
+        let layer = lm.layers[0]
+        let dtype = lm.embedTokens.weight.dtype
+        let x = mergedEmbeds.asType(dtype)
+        return layer.debugAttn0(x, positionIds: positionIds)
+    }
+
+    /// Bisect helper: replay the language model per layer from given merged embeddings
+    /// (deepstack injected after layers 0..<deepstack.count), returning each layer's
+    /// output hidden plus the final norm output.
+    public func debugLanguageLayers(
+        inputIds: MLXArray, mergedEmbeds: MLXArray, positionIds: MLXArray,
+        deepstackEmbeds: [MLXArray]
+    ) -> (layers: [MLXArray], final: MLXArray) {
+        let lm = languageModel.model
+        let visualMask = (inputIds .== MLXArray(config.imageTokenIndex)).asType(.bool)
+        // Match production numerics: run the replay in the model's dtype.
+        let dtype = lm.embedTokens.weight.dtype
+        let deepstackEmbeds = deepstackEmbeds.map { $0.asType(dtype) }
+        var hidden = mergedEmbeds.asType(dtype)
+        var perLayer: [MLXArray] = []
+        for (index, layer) in lm.layers.enumerated() {
+            hidden = layer(hidden, mask: nil, cache: nil, positionIds: positionIds)
+            if index < deepstackEmbeds.count {
+                hidden = lm.debugApplyDeepstack(
+                    hiddenStates: hidden, visualMask: visualMask,
+                    visualEmbeds: deepstackEmbeds[index])
+            }
+            eval(hidden)
+            perLayer.append(hidden)
+        }
+        return (perLayer, lm.norm(hidden))
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
