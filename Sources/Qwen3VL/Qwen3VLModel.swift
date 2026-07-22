@@ -1260,14 +1260,27 @@ enum Qwen3VLLanguage {
 
         /// Same forward as callAsFunction but returns the pre-lm_head last_hidden_state
         /// (= model's final norm output) — the conditioning feature Boogu-Image consumes.
+        ///
+        /// `positionIds` overrides the computed spatial M-RoPE indices. Mage-Flow
+        /// patches Qwen3-VL to pass a flat per-sequence `arange` expanded to 3
+        /// identical rows, so M-RoPE degenerates to ordinary 1-D RoPE even for
+        /// image tokens; passing that here reproduces it. Leave nil for the
+        /// default (Boogu-Image, and any caller wanting real M-RoPE).
         func hiddenState(
             _ inputIds: MLXArray?,
             inputEmbeddings: MLXArray?,
             visualMask: MLXArray?,
             deepstackEmbeds: [MLXArray]?,
             pixelValues: MLXArray?,
-            imageGridTHW: [THW]?
+            imageGridTHW: [THW]?,
+            positionIds overridePositionIds: MLXArray? = nil
         ) -> MLXArray {
+            if let overridePositionIds {
+                return model(
+                    inputIds, cache: nil, inputEmbeddings: inputEmbeddings, mask: nil,
+                    positionIds: overridePositionIds, visualMask: visualMask,
+                    deepstackEmbeds: deepstackEmbeds)
+            }
             var positionIds: MLXArray? = nil
             if let inputIds {
                 let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
@@ -1572,8 +1585,13 @@ public final class Qwen3VL: Module {
 
     /// Run the Qwen3-VL forward and return the last_hidden_state [1, L, hidden].
     /// Text-only (T2I) when pixelValues is nil; vision-merged (Edit) otherwise.
+    ///
+    /// `positionIds` overrides the computed spatial M-RoPE indices — see
+    /// `LanguageModel.hiddenState`. Mage-Flow requires a flat `arange` here;
+    /// its autoregressive content-filter path must NOT use the override.
     public func lastHiddenState(
-        inputIds: MLXArray, pixelValues: MLXArray? = nil, imageGridTHW: [THW]? = nil
+        inputIds: MLXArray, pixelValues: MLXArray? = nil, imageGridTHW: [THW]? = nil,
+        positionIds: MLXArray? = nil
     ) throws -> MLXArray {
         var inputEmbeddings: MLXArray? = nil
         var visualMask: MLXArray? = nil
@@ -1602,7 +1620,87 @@ public final class Qwen3VL: Module {
 
         return languageModel.hiddenState(
             inputIds, inputEmbeddings: inputEmbeddings, visualMask: visualMask,
-            deepstackEmbeds: deepstackEmbeds, pixelValues: pixelValues, imageGridTHW: imageGridTHW)
+            deepstackEmbeds: deepstackEmbeds, pixelValues: pixelValues,
+            imageGridTHW: imageGridTHW, positionIds: positionIds)
+    }
+
+    /// Flat per-sequence positions expanded to the 3 M-RoPE rows — the
+    /// degenerate 1-D case Mage-Flow's `qwen3_patch_forward` feeds.
+    public static func flatPositionIds(sequenceLength: Int, batch: Int = 1) -> MLXArray {
+        let base = MLXArray(0 ..< sequenceLength).asType(.int32)[.newAxis, 0...]
+        return tiled(base[.newAxis, 0..., 0...], repetitions: [3, batch, 1])
+    }
+
+    /// Vision-merge shared by `lastHiddenState` and `generate`.
+    private func prepareVisionInputs(inputIds: MLXArray, pixelValues: MLXArray?,
+                                     imageGridTHW: [THW]?)
+        throws -> (embeds: MLXArray?, visualMask: MLXArray?, deepstack: [MLXArray]?)
+    {
+        guard let pixelValues, let framesList = imageGridTHW, !framesList.isEmpty else {
+            return (nil, nil, nil)
+        }
+        let textEmbeds = languageModel.model.embedTokens(inputIds)
+        let (visionHidden, deepstackOutputs) = visionModel(pixelValues, gridTHW: framesList)
+        let mergeSize = config.visionConfiguration.spatialMergeSize
+        let splits = framesList.map { $0.product / (mergeSize * mergeSize) }
+        let splitIndices = cumulativeSplitIndices(from: splits)
+        let flattenedFeatures = concatenated(visionHidden.split(indices: splitIndices))
+            .asType(textEmbeds.dtype)
+        let (merged, mask) = try mergeInputIdsWithImageFeatures(
+            imageFeatures: flattenedFeatures, inputEmbeds: textEmbeds, inputIds: inputIds,
+            imageTokenIndex: config.imageTokenIndex, videoTokenIndex: config.videoTokenIndex)
+        var deepstack: [MLXArray]? = nil
+        if !deepstackOutputs.isEmpty {
+            deepstack = deepstackOutputs.map {
+                concatenated($0.split(indices: splitIndices)).asType(textEmbeds.dtype)
+            }
+        }
+        return (merged, mask, deepstack)
+    }
+
+    /// Greedy autoregressive decode, returning the generated token ids.
+    ///
+    /// Mage-Flow runs a MANDATORY Qwen3-VL content classifier before every
+    /// generation — two greedy `.generate()` calls, <=192 new tokens, fail-closed
+    /// — on these same weights. This restores that path.
+    ///
+    /// Note this deliberately does NOT take a `positionIds` override: the filter
+    /// wants real spatial M-RoPE. Only the diffusion-conditioning path
+    /// (`lastHiddenState`) uses the flat override.
+    public func generate(
+        inputIds: MLXArray,
+        pixelValues: MLXArray? = nil,
+        imageGridTHW: [THW]? = nil,
+        maxTokens: Int = 192,
+        eosTokenIds: Set<Int32> = [151_645]
+    ) throws -> [Int32] {
+        let (embeds, visualMask, deepstack) = try prepareVisionInputs(
+            inputIds: inputIds, pixelValues: pixelValues, imageGridTHW: imageGridTHW)
+
+        let caches: [KVCache] = (0 ..< config.textConfiguration.numHiddenLayers)
+            .map { _ in KVCacheSimple() }
+
+        // Prefill.
+        var out = languageModel(
+            inputIds, cache: caches, inputEmbeddings: embeds, mask: nil, positionIds: nil,
+            visualMask: visualMask, deepstackEmbeds: deepstack,
+            pixelValues: pixelValues, imageGridTHW: imageGridTHW, videoGridTHW: nil)
+
+        var result: [Int32] = []
+        for _ in 0 ..< maxTokens {
+            let last = out.logits[0..., -1, 0...].asType(.float32)
+            let next = argMax(last, axis: -1)
+            eval(next)
+            let tok = next.asArray(Int32.self)[0]
+            if eosTokenIds.contains(tok) { break }
+            result.append(tok)
+            // Decode step: one token, cache carries the offset and rope deltas.
+            out = languageModel(
+                MLXArray([tok], [1, 1]), cache: caches, inputEmbeddings: nil, mask: nil,
+                positionIds: nil, visualMask: nil, deepstackEmbeds: nil,
+                pixelValues: nil, imageGridTHW: nil, videoGridTHW: nil)
+        }
+        return result
     }
 
     /// Bisect helper: expose Edit intermediates for stage-by-stage parity vs mlx-vlm.
