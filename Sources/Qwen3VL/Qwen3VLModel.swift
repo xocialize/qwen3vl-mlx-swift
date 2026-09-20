@@ -1076,7 +1076,8 @@ enum Qwen3VLLanguage {
             mask: MLXArray?,
             positionIds: MLXArray?,
             visualMask: MLXArray?,
-            deepstackEmbeds: [MLXArray]?
+            deepstackEmbeds: [MLXArray]?,
+            applyFinalNorm: Bool = true
         ) -> MLXArray {
             var hidden: MLXArray
             if let inputEmbeddings {
@@ -1106,7 +1107,10 @@ enum Qwen3VLLanguage {
                 }
             }
 
-            return norm(hidden)
+            // `applyFinalNorm: false` returns the last decoder layer's output BEFORE the final
+            // RMSNorm — transformers-4.x `hidden_states[-1]`, the feature Qwen-Image-2.1's DiT was
+            // trained on (diffusers QwenImage21Pipeline neutralizes `norm` with a hook to get it).
+            return applyFinalNorm ? norm(hidden) : hidden
         }
 
         /// Bisect-only alias for the private deepstack scatter-add.
@@ -1273,13 +1277,14 @@ enum Qwen3VLLanguage {
             deepstackEmbeds: [MLXArray]?,
             pixelValues: MLXArray?,
             imageGridTHW: [THW]?,
-            positionIds overridePositionIds: MLXArray? = nil
+            positionIds overridePositionIds: MLXArray? = nil,
+            applyFinalNorm: Bool = true
         ) -> MLXArray {
             if let overridePositionIds {
                 return model(
                     inputIds, cache: nil, inputEmbeddings: inputEmbeddings, mask: nil,
                     positionIds: overridePositionIds, visualMask: visualMask,
-                    deepstackEmbeds: deepstackEmbeds)
+                    deepstackEmbeds: deepstackEmbeds, applyFinalNorm: applyFinalNorm)
             }
             var positionIds: MLXArray? = nil
             if let inputIds {
@@ -1297,7 +1302,8 @@ enum Qwen3VLLanguage {
             }
             return model(
                 inputIds, cache: nil, inputEmbeddings: inputEmbeddings, mask: nil,
-                positionIds: positionIds, visualMask: visualMask, deepstackEmbeds: deepstackEmbeds)
+                positionIds: positionIds, visualMask: visualMask, deepstackEmbeds: deepstackEmbeds,
+                applyFinalNorm: applyFinalNorm)
         }
 
     }
@@ -1589,9 +1595,13 @@ public final class Qwen3VL: Module {
     /// `positionIds` overrides the computed spatial M-RoPE indices — see
     /// `LanguageModel.hiddenState`. Mage-Flow requires a flat `arange` here;
     /// its autoregressive content-filter path must NOT use the override.
+    ///
+    /// `applyFinalNorm: false` skips the language model's final RMSNorm and returns the raw
+    /// last-decoder-layer output (transformers-4.x `hidden_states[-1]`). Qwen-Image-2.1 conditions
+    /// on that pre-norm tensor; Boogu-Image and the default keep the normed `last_hidden_state`.
     public func lastHiddenState(
         inputIds: MLXArray, pixelValues: MLXArray? = nil, imageGridTHW: [THW]? = nil,
-        positionIds: MLXArray? = nil
+        positionIds: MLXArray? = nil, applyFinalNorm: Bool = true
     ) throws -> MLXArray {
         var inputEmbeddings: MLXArray? = nil
         var visualMask: MLXArray? = nil
@@ -1621,7 +1631,7 @@ public final class Qwen3VL: Module {
         return languageModel.hiddenState(
             inputIds, inputEmbeddings: inputEmbeddings, visualMask: visualMask,
             deepstackEmbeds: deepstackEmbeds, pixelValues: pixelValues,
-            imageGridTHW: imageGridTHW, positionIds: positionIds)
+            imageGridTHW: imageGridTHW, positionIds: positionIds, applyFinalNorm: applyFinalNorm)
     }
 
     /// Flat per-sequence positions expanded to the 3 M-RoPE rows — the
