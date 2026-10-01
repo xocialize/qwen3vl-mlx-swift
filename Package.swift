@@ -16,7 +16,9 @@ let package = Package(
         .library(name: "Qwen3VL", targets: ["Qwen3VL"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.4"),
+        // 0.32.3 carries the NAX split-K GEMM fix (mlx#3810); the MLP's row-chunk workaround is gone,
+        // so earlier versions would corrupt half-precision down_proj at ≥1024 tokens on M5.
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.32.3"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
     ],

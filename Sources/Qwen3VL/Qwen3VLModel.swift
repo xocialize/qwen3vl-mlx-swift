@@ -933,32 +933,7 @@ enum Qwen3VLLanguage {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            downProjected(silu(gate(x)) * up(x))
-        }
-
-        /// mlx-swift 0.31.3–0.31.6 dispatches half-precision GEMMs with
-        /// M·N ≥ 2048², K ≥ 10240, K ≥ 3·max(M,N) to `steel_gemm_splitk_axpby_nax`,
-        /// which returns garbage/NaN on M5-class (NAX) GPUs — observed on M5 Max,
-        /// macOS 26.x beta, bit-exactly at the M=1024 dispatch boundary while
-        /// M ≤ 896 is correct (Python mlx 0.31.2, which predates the kernel, is
-        /// correct on the same inputs). down_proj (K=12288, N=4096) crosses that
-        /// boundary once the sequence reaches 1024 tokens — a 1024²-pixel image
-        /// grid — corrupting every decoder layer. Chunk rows below the threshold:
-        /// output rows are independent, so this is mathematically exact.
-        /// TODO: remove when https://github.com/ml-explore/mlx/issues/3797 is
-        /// fixed and mlx-swift ships the fix.
-        func downProjected(_ x: MLXArray) -> MLXArray {
-            let tokens = x.dim(-2)
-            let rowLimit = 896
-            guard x.dtype != .float32, tokens > rowLimit else { return down(x) }
-            var parts: [MLXArray] = []
-            var start = 0
-            while start < tokens {
-                let end = min(start + rowLimit, tokens)
-                parts.append(down(x[.ellipsis, start ..< end, 0...]))
-                start = end
-            }
-            return concatenated(parts, axis: -2)
+            down(silu(gate(x)) * up(x))
         }
     }
 
@@ -1046,7 +1021,7 @@ enum Qwen3VLLanguage {
             out.append(("up_out", upOut))
             let gated = silu(gateOut) * upOut
             out.append(("gated", gated))
-            let mlpDown = mlp.downProjected(gated)
+            let mlpDown = mlp.down(gated)
             out.append(("mlp_down", mlpDown))
             out.append(("layer_out", hidden + mlpDown))
             return out
