@@ -21,6 +21,9 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.32.3"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
+        // ≥ 0.1.1: the vision patch embed (a 3-channel conv3d) never reaches mlx 0.32.2's
+        // channel-pad helper, which frees a buffer the GPU still reads (AB-T-0214).
+        .package(url: "https://github.com/xocialize/mlx-exact-conv-swift", from: "0.1.1"),
     ],
     targets: [
         .target(
@@ -29,6 +32,7 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXExactConv", package: "mlx-exact-conv-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "Hub", package: "swift-transformers"),
@@ -39,6 +43,16 @@ let package = Package(
             name: "Qwen3VLGate",
             dependencies: ["Qwen3VL"],
             path: "Sources/Qwen3VLGate"
+        ),
+        .testTarget(
+            name: "Qwen3VLTests",
+            dependencies: [
+                "Qwen3VL",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "MLXExactConv", package: "mlx-exact-conv-swift"),
+            ],
+            path: "Tests/Qwen3VLTests"
         ),
     ]
 )

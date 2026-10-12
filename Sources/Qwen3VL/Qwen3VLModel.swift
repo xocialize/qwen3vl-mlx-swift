@@ -4,6 +4,7 @@
 
 import Foundation
 import MLX
+import MLXExactConv
 import MLXLMCommon
 import MLXNN
 
@@ -286,7 +287,14 @@ enum Qwen3VLVision {
                 patchSize
             ).movedAxis(source: 1, destination: 4)
 
-            states = proj(states)
+            // Through ExactConv, not `proj(_:)`: a 3-channel conv3d is what mlx 0.32.2's
+            // `pad_and_slice_conv_3D_gpu` serves, and that helper frees its zero fill value while
+            // the GPU still reads it — under a capped buffer cache (the Image Engine's 2 GiB) the
+            // process dies with "Invalid Resource" (AB-T-0214). ExactConv pads the channels to 16 in
+            // the graph and runs the same implicit GEMM; `proj` keeps the weight and its key.
+            states = ExactConv.conv3d(
+                states, weight: proj.weight, bias: proj.bias,
+                stride: (temporalPatchSize, patchSize, patchSize))
             states = states.reshaped(-1, hiddenSize)
             return states
         }
